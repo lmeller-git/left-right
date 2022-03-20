@@ -15,6 +15,10 @@ categories = ["concurrency"]
 slab = "0.4.1"
 crossbeam-utils = { version = "0.8", default-features = false }
 
+[features]
+default = ["std"]
+std = []
+
 [target.'cfg(loom)'.dependencies]
 loom = "0.7.2"
 
