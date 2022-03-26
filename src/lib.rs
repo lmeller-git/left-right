@@ -194,6 +194,8 @@ mod read;
 pub use crate::read::{ReadGuard, ReadHandle, ReadHandleFactory};
 use crossbeam_utils::CachePadded;
 
+mod handle_list;
+
 pub mod aliasing;
 
 /// Types that can incorporate operations of type `O`.
