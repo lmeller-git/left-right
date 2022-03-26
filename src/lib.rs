@@ -181,10 +181,10 @@ extern crate alloc;
 
 mod sync;
 
-use crate::sync::{Arc, AtomicUsize, Mutex};
+use crate::sync::Arc;
 use alloc::boxed::Box;
 
-type Epochs = Arc<Mutex<slab::Slab<Arc<CachePadded<AtomicUsize>>>>>;
+type Epochs = Arc<handle_list::HandleList>;
 
 mod write;
 pub use crate::write::Taken;
