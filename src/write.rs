@@ -10,7 +10,7 @@ use core::ops::DerefMut;
 use core::ptr::NonNull;
 use crossbeam_utils::CachePadded;
 #[cfg(test)]
-use std::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicBool;
 
 /// A writer handle to a left-right guarded data structure.
 ///
@@ -621,9 +621,11 @@ mod tests {
     use slab::Slab;
     include!("./utilities.rs");
 
+    fn test_yield() {}
+
     #[test]
     fn append_test() {
-        let (mut w, _r) = crate::new::<i32, _>();
+        let (mut w, _r) = crate::new_with_yield::<i32, _>(test_yield);
         assert_eq!(w.first, true);
         w.append(CounterAddOp(1));
         assert_eq!(w.oplog.len(), 0);
@@ -638,7 +640,7 @@ mod tests {
     #[test]
     fn take_test() {
         // publish twice then take with no pending operations
-        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
+        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
         w.append(CounterAddOp(1));
         w.publish();
         w.append(CounterAddOp(1));
@@ -646,7 +648,7 @@ mod tests {
         assert_eq!(*w.take(), 4);
 
         // publish twice then pending operation published by take
-        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
+        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
         w.append(CounterAddOp(1));
         w.publish();
         w.append(CounterAddOp(1));
@@ -655,29 +657,30 @@ mod tests {
         assert_eq!(*w.take(), 6);
 
         // normal publish then pending operations published by take
-        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
+        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
         w.append(CounterAddOp(1));
         w.publish();
         w.append(CounterAddOp(1));
         assert_eq!(*w.take(), 4);
 
         // pending operations published by take
-        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
+        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
         w.append(CounterAddOp(1));
         assert_eq!(*w.take(), 3);
 
         // emptry op queue
-        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
+        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
         w.append(CounterAddOp(1));
         w.publish();
         assert_eq!(*w.take(), 3);
 
         // no operations
-        let (w, _r) = crate::new_from_empty::<i32, _>(2);
+        let (w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
         assert_eq!(*w.take(), 2);
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn wait_test() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -735,7 +738,7 @@ mod tests {
 
     #[test]
     fn flush_noblock() {
-        let (mut w, r) = crate::new::<i32, _>();
+        let (mut w, r) = crate::new_with_yield::<i32, _>(test_yield);
         w.append(CounterAddOp(42));
         w.publish();
         assert_eq!(*r.enter().unwrap(), 42);
@@ -749,7 +752,7 @@ mod tests {
 
     #[test]
     fn flush_no_refresh() {
-        let (mut w, _) = crate::new::<i32, _>();
+        let (mut w, _) = crate::new_with_yield::<i32, _>(test_yield);
 
         // Until we refresh, writes are written directly instead of going to the
         // oplog (because there can't be any readers on the w_handle table).
