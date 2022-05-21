@@ -2,9 +2,7 @@ use crate::handle_list::ListSnapshot;
 use crate::read::ReadHandle;
 use crate::Absorb;
 
-#[cfg(test)]
-use crate::sync::Arc;
-use crate::sync::{fence, Ordering};
+use crate::sync::{fence, Arc, Ordering};
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::fmt;
 use core::marker::PhantomData;
@@ -176,9 +174,6 @@ where
         let r_handle = self.r_handle.inner.swap(ptr::null_mut(), Ordering::Release);
 
         // now, wait for all readers to depart
-        //let epochs = Arc::clone(&self.epochs);
-        //let mut epochs = epochs.lock().unwrap();
-
         let epoch_snapshot = self.epochs.snapshot();
         self.wait(&epoch_snapshot);
 
@@ -357,9 +352,12 @@ where
         // we need to wait until all epochs have changed since the swaps *or* until a "finished"
         // flag has been observed to be on for two subsequent iterations (there still may be some
         // readers present since we did the previous refresh)
-
+        //
+        // NOTE:
+        // Here we take a Snapshot of the currently existing Readers and only consider these
+        // as all new readers will already be on the other copy, so there is no need to wait for
+        // them
         let epoch_snapshot = self.epochs.snapshot();
-
         self.wait(&epoch_snapshot);
 
         self.update_and_swap(&epoch_snapshot)
