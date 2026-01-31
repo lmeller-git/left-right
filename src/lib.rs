@@ -182,8 +182,10 @@ extern crate alloc;
 mod sync;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::sync::atomic::AtomicUsize;
 
-type Epochs = handle_list::HandleList;
+type Epochs = Arc<sento::Pool<Arc<AtomicUsize>>>;
 
 mod write;
 pub use crate::write::Taken;
@@ -191,9 +193,6 @@ pub use crate::write::WriteHandle;
 
 mod read;
 pub use crate::read::{ReadGuard, ReadHandle, ReadHandleFactory};
-use crossbeam_utils::CachePadded;
-
-mod handle_list;
 
 pub mod aliasing;
 
@@ -271,16 +270,21 @@ pub trait Absorb<O> {
     fn sync_with(&mut self, first: &Self);
 }
 
-/// Construct a new write and read handle pair from an empty data structure with
-/// [`yield_now`](std::thread::yield_now) as the yield function.
+/// Construct a new write and read handle pair from an empty data structure.
 ///
 /// See [`new_from_empty_with_yield`] for a more detailed explanation
-#[cfg(feature = "std")]
 pub fn new_from_empty<T, O>(t: T) -> (WriteHandle<T, O>, ReadHandle<T>)
 where
     T: Absorb<O> + Clone,
 {
-    new_from_empty_with_yield(t, std::thread::yield_now)
+    #[cfg(feature = "std")]
+    {
+        new_from_empty_with_yield(t, std::thread::yield_now)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        new_from_empty_with_yield(t, core::hint::spin_loop)
+    }
 }
 
 /// Construct a new write and read handle pair from an empty data structure.
@@ -300,16 +304,21 @@ where
     (w, r)
 }
 
-/// Construct a new write and read handle pair from the data structure default, with
-/// [`yield_now`](std::thread::yield_now) as the yield function.
+/// Construct a new write and read handle pair from the data structure default.
 ///
 /// See [`new_with_yield`] for a more detailed explanation.
-#[cfg(feature = "std")]
 pub fn new<T, O>() -> (WriteHandle<T, O>, ReadHandle<T>)
 where
     T: Absorb<O> + Default,
 {
-    new_with_yield(std::thread::yield_now)
+    #[cfg(feature = "std")]
+    {
+        new_with_yield(std::thread::yield_now)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        new_with_yield(core::hint::spin_loop)
+    }
 }
 
 /// Construct a new write and read handle pair from the data structure default.

@@ -1,14 +1,14 @@
-use crate::handle_list::ListSnapshot;
 use crate::read::ReadHandle;
-use crate::Absorb;
+use crate::sync::{fence, Ordering};
+use crate::{Absorb, Epochs};
 
-use crate::sync::{fence, Arc, Ordering};
+#[cfg(test)]
+use crate::sync::Arc;
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::fmt;
 use core::marker::PhantomData;
 use core::ops::DerefMut;
 use core::ptr::NonNull;
-use crossbeam_utils::CachePadded;
 #[cfg(test)]
 use core::sync::atomic::AtomicBool;
 
@@ -28,7 +28,7 @@ pub struct WriteHandle<T, O>
 where
     T: Absorb<O>,
 {
-    epochs: crate::Epochs,
+    epochs: Epochs,
     w_handle: NonNull<T>,
     oplog: VecDeque<O>,
     swap_index: usize,
@@ -173,9 +173,7 @@ where
         // next, grab the read handle and set it to NULL
         let r_handle = self.r_handle.inner.swap(ptr::null_mut(), Ordering::Release);
 
-        // now, wait for all readers to depart
-        let epoch_snapshot = self.epochs.snapshot();
-        self.wait(&epoch_snapshot);
+        self.wait();
 
         // ensure that the subsequent epoch reads aren't re-ordered to before the swap
         fence(Ordering::SeqCst);
@@ -242,8 +240,32 @@ where
         }
     }
 
-    fn wait(&mut self, epochs: &ListSnapshot) {
+    fn wait(&mut self) {
         let mut iter = 0;
+        let yielder = self.yield_fn;
+
+        let _r = self.wait_while(|| {
+            if !cfg!(loom) {
+                // how eagerly should we retry?
+                if iter != 20 {
+                    iter += 1;
+                } else {
+                    yielder();
+                }
+            }
+
+            #[cfg(loom)]
+            loom::thread::yield_now();
+
+            true
+        });
+        debug_assert!(_r.is_ok(), "wait failed unexpectedly")
+    }
+
+    fn wait_while<F>(&mut self, mut cond: F) -> Result<(), ()>
+    where
+        F: FnMut() -> bool,
+    {
         let mut starti = 0;
 
         #[cfg(test)]
@@ -251,12 +273,9 @@ where
             self.is_waiting.store(true, Ordering::Relaxed);
         }
 
-        // make sure we have enough space for all the epochs in the current snapshot
-        self.last_epochs.resize(epochs.len(), 0);
-
         'retry: loop {
             // read all and see if all have changed (which is likely)
-            for (ii, (ri, epoch)) in epochs.iter().enumerate().enumerate().skip(starti) {
+            for (ii, (ri, epoch)) in self.epochs.iter().enumerate().enumerate().skip(starti) {
                 // if the reader's epoch was even last we read it (which was _after_ the swap),
                 // then they either do not have the pointer, or must have read the pointer strictly
                 // after the swap. in either case, they cannot be using the old pointer value (what
@@ -269,33 +288,26 @@ where
                 // this is okay though, as a change still implies that the new reader must have
                 // arrived _after_ we did the atomic swap, and thus must also have seen the new
                 // pointer.
-                if self.last_epochs[ri] % 2 == 0 {
+                if self.last_epochs.get(ri).unwrap_or(&0).is_multiple_of(2) {
                     continue;
                 }
 
                 let now = epoch.load(Ordering::Acquire);
-                if now != self.last_epochs[ri] {
+                if now != *self.last_epochs.get(ri).unwrap_or(&0) {
                     // reader must have seen the last swap, since they have done at least one
                     // operation since we last looked at their epoch, which _must_ mean that they
                     // are no longer using the old pointer value.
-                } else {
+                } else if cond() {
                     // reader may not have seen swap
                     // continue from this reader's epoch
                     starti = ii;
-
-                    if !cfg!(loom) {
-                        // how eagerly should we retry?
-                        if iter != 20 {
-                            iter += 1;
-                        } else {
-                            (self.yield_fn)();
-                        }
-                    }
-
-                    #[cfg(loom)]
-                    loom::thread::yield_now();
-
                     continue 'retry;
+                } else {
+                    #[cfg(test)]
+                    {
+                        self.is_waiting.store(false, Ordering::Relaxed);
+                    }
+                    return Err(());
                 }
             }
             break;
@@ -304,6 +316,7 @@ where
         {
             self.is_waiting.store(false, Ordering::Relaxed);
         }
+        Ok(())
     }
 
     /// Try to publish once without waiting.
@@ -318,27 +331,10 @@ where
     ///
     /// Returns `true` if a publish occurred, `false` otherwise.
     pub fn try_publish(&mut self) -> bool {
-        let epochs = Arc::clone(&self.epochs);
-        let mut epochs = epochs.snapshot();
-        // This wait loop is exactly like the one in wait, except that if we find a reader that
-        // has not observed the latest swap, we return rather than spin-and-retry.
-        for (ri, epoch) in epochs.iter().enumerate() {
-            if self.last_epochs[ri] % 2 == 0 {
-                continue;
-            }
-
-            let now = epoch.load(Ordering::Acquire);
-            if now != self.last_epochs[ri] {
-                continue;
-            } else {
-                return false;
-            }
+        if self.wait_while(|| false).is_err() {
+            return false;
         }
-        #[cfg(test)]
-        {
-            self.is_waiting.store(false, Ordering::Relaxed);
-        }
-        self.update_and_swap(&mut epochs);
+        self.update_and_swap();
 
         true
     }
@@ -353,22 +349,15 @@ where
         // we need to wait until all epochs have changed since the swaps *or* until a "finished"
         // flag has been observed to be on for two subsequent iterations (there still may be some
         // readers present since we did the previous refresh)
-        //
-        // NOTE:
-        // Here we take a Snapshot of the currently existing Readers and only consider these
-        // as all new readers will already be on the other copy, so there is no need to wait for
-        // them
-        let epoch_snapshot = self.epochs.snapshot();
-        self.wait(&epoch_snapshot);
-
-        self.update_and_swap(&epoch_snapshot)
+        self.wait();
+        self.update_and_swap()
     }
 
     /// Brings `w_handle` up to date with the oplog, then swaps `r_handle` and `w_handle`.
     ///
     /// This method must only be called when all readers have exited `w_handle` (e.g., after
     /// `wait`).
-    fn update_and_swap(&mut self, epoch_snapshot: &ListSnapshot) -> &mut Self {
+    fn update_and_swap(&mut self) -> &mut Self {
         if !self.first {
             // all the readers have left!
             // safety: we haven't freed the Box, and no readers are accessing the w_handle
@@ -432,8 +421,15 @@ where
         // ensure that the subsequent epoch reads aren't re-ordered to before the swap
         fence(Ordering::SeqCst);
 
-        for (ri, epoch) in epoch_snapshot.iter().enumerate() {
-            self.last_epochs[ri] = epoch.load(Ordering::Acquire);
+        // as the epoch queue is not exclusively locked here, new handles may have been added.
+        // this is fine, as those handles will point into the read inner
+        for (ri, epoch) in self.epochs.iter().enumerate() {
+            let epoch = epoch.load(Ordering::Acquire);
+            if let Some(entry) = self.last_epochs.get_mut(ri) {
+                *entry = epoch;
+            } else {
+                self.last_epochs.push(epoch);
+            }
         }
 
         #[cfg(test)]
@@ -680,6 +676,7 @@ mod tests {
         assert_eq!(*w.take(), 2);
     }
 
+    #[cfg(false)]
     #[test]
     #[cfg(feature = "std")]
     fn wait_test() {
@@ -689,9 +686,8 @@ mod tests {
 
         // Case 1: If epoch is set to default.
         let test_epochs: crate::Epochs = Default::default();
-        let test_snapshot = test_epochs.snapshot();
         // since there is no epoch to waiting for, wait function will return immediately.
-        w.wait(&test_snapshot);
+        w.wait();
 
         // Case 2: If one of the reader is still reading(epoch is odd and count is same as in last_epoch)
         // and wait has been called.

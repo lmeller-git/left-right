@@ -12,8 +12,8 @@ keywords = ["concurrency","lock-free"]
 categories = ["concurrency"]
 
 [dependencies]
-slab = "0.4.1"
 crossbeam-utils = { version = "0.8", default-features = false }
+sento = "0.1.1"
 
 [features]
 default = ["std"]

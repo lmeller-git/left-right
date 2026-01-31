@@ -1,6 +1,6 @@
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::{cell::Cell, thread};
 
 use left_right::{
     aliasing::{Aliased, DropBehavior},
@@ -125,7 +125,7 @@ fn deque() {
         assert!(guard.iter().map(|v| &v.v).eq(expected.iter()));
     };
 
-    let (mut w, r) = left_right::new::<Deque, Op>();
+    let (mut w, r) = left_right::new_with_yield::<Deque, Op>(thread::yield_now);
     w.append(Op::PushBack(mkval(1)));
     w.append(Op::PushBack(mkval(2)));
     w.append(Op::PushBack(mkval(3)));
