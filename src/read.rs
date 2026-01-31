@@ -4,6 +4,7 @@ use core::cell::Cell;
 use core::fmt;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
+use crossbeam_utils::CachePadded;
 
 // To make [`WriteHandle`] and friends work.
 #[cfg(doc)]
@@ -41,7 +42,8 @@ pub struct ReadHandle<T> {
     pub(crate) inner: Arc<AtomicPtr<T>>,
     pub(crate) epochs: crate::Epochs,
     // NOTE we may want to hold an Acquired<'pool, T> in order to release later, however this leads to lifetime complications
-    epoch: Arc<AtomicUsize>,
+    // alternatively add a Acquired::from_ref method in sento, which returns the underlying Acquired for some &T (walk list or use repr c Acquired?)
+    epoch: Arc<CachePadded<AtomicUsize>>,
     enters: Cell<usize>,
 
     // `ReadHandle` is _only_ Send if T is Sync. If T is !Sync, then it's not okay for us to expose

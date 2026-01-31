@@ -172,7 +172,7 @@
     missing_docs,
     rust_2018_idioms,
     missing_debug_implementations,
-    broken_intra_doc_links
+    rustdoc::broken_intra_doc_links
 )]
 #![allow(clippy::type_complexity)]
 
@@ -184,8 +184,9 @@ mod sync;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicUsize;
+use crossbeam_utils::CachePadded;
 
-type Epochs = Arc<sento::Pool<Arc<AtomicUsize>>>;
+type Epochs = Arc<sento::Pool<Arc<CachePadded<AtomicUsize>>>>;
 
 mod write;
 pub use crate::write::Taken;
