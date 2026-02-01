@@ -18,7 +18,7 @@ spin = "0.10.0"
 
 [features]
 default = ["std"]
-std = ["spin/std"]
+std = []
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.7.2"

@@ -12,6 +12,10 @@ mod mutex {
     pub(crate) struct Mutex<T>(loom::sync::Mutex<T>);
 
     impl<T> Mutex<T> {
+        #[allow(dead_code)]
+        pub(crate) const fn new(t: T) -> Self {
+            Self(loom::sync::Mutex::new(t))
+        }
         pub fn lock(&self) -> MutexGuard<'_, T> {
             self.0.lock().unwrap()
         }
@@ -41,4 +45,22 @@ pub(crate) use core::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 pub(crate) use spin::{Mutex, MutexGuard};
 
 #[cfg(all(not(loom), feature = "std"))]
-pub(crate) use spin::{Mutex, MutexGuard};
+pub(crate) use mutex::*;
+
+#[cfg(all(not(loom), feature = "std"))]
+mod mutex {
+    pub(crate) use std::sync::MutexGuard;
+
+    #[derive(Debug, Default)]
+    pub(crate) struct Mutex<T>(std::sync::Mutex<T>);
+
+    impl<T> Mutex<T> {
+        #[allow(dead_code)]
+        pub(crate) const fn new(t: T) -> Self {
+            Self(std::sync::Mutex::new(t))
+        }
+        pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
+            self.0.lock().unwrap()
+        }
+    }
+}
