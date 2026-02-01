@@ -14,6 +14,8 @@ categories = ["concurrency"]
 [dependencies]
 crossbeam-utils = { version = "0.8", default-features = false }
 sento = "0.1.1"
+slab = "0.4.12"
+spin = "0.10.0"
 
 [features]
 default = ["std"]

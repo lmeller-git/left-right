@@ -2,8 +2,8 @@ use crate::read::ReadHandle;
 use crate::sync::{fence, Ordering};
 use crate::{Absorb, Epochs};
 
-#[cfg(test)]
 use crate::sync::Arc;
+use crate::sync::MutexGuard;
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::fmt;
 use core::marker::PhantomData;
@@ -11,6 +11,7 @@ use core::ops::DerefMut;
 use core::ptr::NonNull;
 #[cfg(test)]
 use core::sync::atomic::AtomicBool;
+use crossbeam_utils::CachePadded;
 
 /// A writer handle to a left-right guarded data structure.
 ///
@@ -173,7 +174,10 @@ where
         // next, grab the read handle and set it to NULL
         let r_handle = self.r_handle.inner.swap(ptr::null_mut(), Ordering::Release);
 
-        self.wait();
+        // now, wait for all readers to depart
+        let epochs = Arc::clone(&self.epochs);
+        let mut epochs = epochs.lock().unwrap();
+        self.wait(&mut epochs);
 
         // ensure that the subsequent epoch reads aren't re-ordered to before the swap
         fence(Ordering::SeqCst);
@@ -240,29 +244,36 @@ where
         }
     }
 
-    fn wait(&mut self) {
+    fn wait(&mut self, epochs: &mut MutexGuard<'_, slab::Slab<Arc<CachePadded<AtomicUsize>>>>) {
         let mut iter = 0;
         let yielder = self.yield_fn;
 
-        let _r = self.wait_while(|| {
-            if !cfg!(loom) {
-                // how eagerly should we retry?
-                if iter != 20 {
-                    iter += 1;
-                } else {
-                    yielder();
+        let _r = self.wait_while(
+            || {
+                if !cfg!(loom) {
+                    // how eagerly should we retry?
+                    if iter != 20 {
+                        iter += 1;
+                    } else {
+                        yielder();
+                    }
                 }
-            }
 
-            #[cfg(loom)]
-            loom::thread::yield_now();
+                #[cfg(loom)]
+                loom::thread::yield_now();
 
-            true
-        });
+                true
+            },
+            epochs,
+        );
         debug_assert!(_r.is_ok(), "wait failed unexpectedly")
     }
 
-    fn wait_while<F>(&mut self, mut cond: F) -> Result<(), ()>
+    fn wait_while<F>(
+        &mut self,
+        mut cond: F,
+        epochs: &mut MutexGuard<'_, slab::Slab<Arc<CachePadded<AtomicUsize>>>>,
+    ) -> Result<(), ()>
     where
         F: FnMut() -> bool,
     {
@@ -275,7 +286,7 @@ where
 
         'retry: loop {
             // read all and see if all have changed (which is likely)
-            for (ii, (ri, epoch)) in self.epochs.iter().enumerate().enumerate().skip(starti) {
+            for (ii, (ri, epoch)) in epochs.iter().enumerate().skip(starti) {
                 // if the reader's epoch was even last we read it (which was _after_ the swap),
                 // then they either do not have the pointer, or must have read the pointer strictly
                 // after the swap. in either case, they cannot be using the old pointer value (what
@@ -331,10 +342,12 @@ where
     ///
     /// Returns `true` if a publish occurred, `false` otherwise.
     pub fn try_publish(&mut self) -> bool {
-        if self.wait_while(|| false).is_err() {
+        let epochs = Arc::clone(&self.epochs);
+        let mut epochs = epochs.lock().unwrap();
+        if self.wait_while(|| false, &mut epochs).is_err() {
             return false;
         }
-        self.update_and_swap();
+        self.update_and_swap(&mut epochs);
 
         true
     }
@@ -349,15 +362,24 @@ where
         // we need to wait until all epochs have changed since the swaps *or* until a "finished"
         // flag has been observed to be on for two subsequent iterations (there still may be some
         // readers present since we did the previous refresh)
-        self.wait();
-        self.update_and_swap()
+        //
+        // NOTE: it is safe for us to hold the lock for the entire duration of the swap. we will
+        // only block on pre-existing readers, and they are never waiting to push onto epochs
+        // unless they have finished reading.
+        let epochs = Arc::clone(&self.epochs);
+        let mut epochs = epochs.lock().unwrap();
+        self.wait(&mut epochs);
+        self.update_and_swap(&mut epochs)
     }
 
     /// Brings `w_handle` up to date with the oplog, then swaps `r_handle` and `w_handle`.
     ///
     /// This method must only be called when all readers have exited `w_handle` (e.g., after
     /// `wait`).
-    fn update_and_swap(&mut self) -> &mut Self {
+    fn update_and_swap(
+        &mut self,
+        epochs: &mut MutexGuard<'_, slab::Slab<Arc<CachePadded<AtomicUsize>>>>,
+    ) -> &mut Self {
         if !self.first {
             // all the readers have left!
             // safety: we haven't freed the Box, and no readers are accessing the w_handle
@@ -423,7 +445,7 @@ where
 
         // as the epoch queue is not exclusively locked here, new handles may have been added.
         // this is fine, as those handles will point into the read inner
-        for (ri, epoch) in self.epochs.iter().enumerate() {
+        for (ri, epoch) in epochs.iter() {
             let epoch = epoch.load(Ordering::Acquire);
             if let Some(entry) = self.last_epochs.get_mut(ri) {
                 *entry = epoch;
@@ -496,6 +518,7 @@ where
 
 // allow using write handle for reads
 use core::ops::Deref;
+use std::sync::atomic::AtomicUsize;
 impl<T, O> Deref for WriteHandle<T, O>
 where
     T: Absorb<O>,
@@ -612,16 +635,15 @@ struct CheckWriteHandleSend;
 #[cfg(test)]
 mod tests {
     #![allow(clippy::bool_assert_comparison)]
-
-    use crate::sync::Ordering;
+    use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
     use crate::Absorb;
+    use crossbeam_utils::CachePadded;
+    use slab::Slab;
     include!("./utilities.rs");
-
-    fn test_yield() {}
 
     #[test]
     fn append_test() {
-        let (mut w, _r) = crate::new_with_yield::<i32, _>(test_yield);
+        let (mut w, _r) = crate::new::<i32, _>();
         assert_eq!(w.first, true);
         w.append(CounterAddOp(1));
         assert_eq!(w.oplog.len(), 0);
@@ -636,7 +658,7 @@ mod tests {
     #[test]
     fn take_test() {
         // publish twice then take with no pending operations
-        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
+        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
         w.append(CounterAddOp(1));
         w.publish();
         w.append(CounterAddOp(1));
@@ -644,7 +666,7 @@ mod tests {
         assert_eq!(*w.take(), 4);
 
         // publish twice then pending operation published by take
-        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
+        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
         w.append(CounterAddOp(1));
         w.publish();
         w.append(CounterAddOp(1));
@@ -653,30 +675,29 @@ mod tests {
         assert_eq!(*w.take(), 6);
 
         // normal publish then pending operations published by take
-        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
+        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
         w.append(CounterAddOp(1));
         w.publish();
         w.append(CounterAddOp(1));
         assert_eq!(*w.take(), 4);
 
         // pending operations published by take
-        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
+        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
         w.append(CounterAddOp(1));
         assert_eq!(*w.take(), 3);
 
         // emptry op queue
-        let (mut w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
+        let (mut w, _r) = crate::new_from_empty::<i32, _>(2);
         w.append(CounterAddOp(1));
         w.publish();
         assert_eq!(*w.take(), 3);
 
         // no operations
-        let (w, _r) = crate::new_from_empty_with_yield::<i32, _>(2, test_yield);
+        let (w, _r) = crate::new_from_empty::<i32, _>(2);
         assert_eq!(*w.take(), 2);
     }
 
     #[test]
-    #[cfg(feature = "std")]
     fn wait_test() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -684,19 +705,19 @@ mod tests {
 
         // Case 1: If epoch is set to default.
         let test_epochs: crate::Epochs = Default::default();
+        let mut test_epochs = test_epochs.lock().unwrap();
         // since there is no epoch to waiting for, wait function will return immediately.
-        w.wait();
+        w.wait(&mut test_epochs);
 
         // Case 2: If one of the reader is still reading(epoch is odd and count is same as in last_epoch)
         // and wait has been called.
+        let held_epoch = Arc::new(CachePadded::new(AtomicUsize::new(1)));
+
         w.last_epochs = vec![2, 2, 1];
-
-        let [e1, e2, e3] = test_epochs.acquire_many();
-        e1.store(1, Ordering::SeqCst);
-        e2.store(2, Ordering::SeqCst);
-        e3.store(2, Ordering::SeqCst);
-
-        w.epochs = Arc::clone(&test_epochs);
+        let mut epochs_slab = Slab::new();
+        epochs_slab.insert(Arc::new(CachePadded::new(AtomicUsize::new(2))));
+        epochs_slab.insert(Arc::new(CachePadded::new(AtomicUsize::new(2))));
+        epochs_slab.insert(Arc::clone(&held_epoch));
 
         let barrier = Arc::new(Barrier::new(2));
 
@@ -707,19 +728,21 @@ mod tests {
         assert_eq!(false, is_waiting_v);
 
         let barrier2 = Arc::clone(&barrier);
+        let test_epochs = Arc::new(Mutex::new(epochs_slab));
         let wait_handle = thread::spawn(move || {
             barrier2.wait();
-            w.wait();
+            let mut test_epochs = test_epochs.lock().unwrap();
+            w.wait(&mut test_epochs);
         });
 
         barrier.wait();
 
         // make sure that writer wait() will call first, only then allow to updates the held epoch.
-        while !is_waiting.load(Ordering::SeqCst) {
+        while !is_waiting.load(Ordering::Relaxed) {
             thread::yield_now();
         }
 
-        e1.fetch_add(1, Ordering::SeqCst);
+        held_epoch.fetch_add(1, Ordering::SeqCst);
 
         // join to make sure that wait must return after the progress/increment
         // of held_epoch.
@@ -728,7 +751,7 @@ mod tests {
 
     #[test]
     fn flush_noblock() {
-        let (mut w, r) = crate::new_with_yield::<i32, _>(test_yield);
+        let (mut w, r) = crate::new::<i32, _>();
         w.append(CounterAddOp(42));
         w.publish();
         assert_eq!(*r.enter().unwrap(), 42);
@@ -742,7 +765,7 @@ mod tests {
 
     #[test]
     fn flush_no_refresh() {
-        let (mut w, _) = crate::new_with_yield::<i32, _>(test_yield);
+        let (mut w, _) = crate::new::<i32, _>();
 
         // Until we refresh, writes are written directly instead of going to the
         // oplog (because there can't be any readers on the w_handle table).
@@ -769,39 +792,25 @@ mod tests {
         assert_eq!(w.refreshes, 4);
     }
 
-    #[cfg(feature = "std")]
     #[test]
     fn try_publish() {
-        use std::sync::Arc;
         let (mut w, _r) = crate::new::<i32, _>();
 
         // Case 1: A reader has not advanced (odd and unchanged) -> returns false
-        let epochs_slab: crate::Epochs = Default::default();
-        // odd epoch, "in read"
-        let r2 = epochs_slab.acquire();
-        r2.store(1, Ordering::SeqCst);
-
-        // Ensure last_epochs sees this reader as odd and unchanged
-        assert_eq!(epochs_slab.iter().count(), 1);
-        w.last_epochs = vec![0];
-        w.last_epochs[0] = 1;
-
-        w.epochs = Arc::clone(&epochs_slab);
-
+        let mut epochs_slab = Slab::new();
+        let idx = epochs_slab.insert(Arc::new(CachePadded::new(AtomicUsize::new(1)))); // odd epoch, "in read"
+                                                                                       // Ensure last_epochs sees this reader as odd and unchanged
+        w.last_epochs = vec![0; epochs_slab.capacity()];
+        w.last_epochs[idx] = 1;
+        w.epochs = Arc::new(Mutex::new(epochs_slab));
         assert_eq!(w.try_publish(), false);
 
         // Case 2: All readers have advanced since last swap -> returns true and publishes
-        let epochs_slab_ok: crate::Epochs = Default::default();
-        // advanced
-        let entry = epochs_slab_ok.acquire();
-        entry.store(2, Ordering::SeqCst);
-
-        assert_eq!(epochs_slab.iter().count(), 1);
-        w.last_epochs = vec![0];
-        // previously odd
-        w.last_epochs[0] = 1;
-
-        w.epochs = Arc::clone(&epochs_slab_ok);
+        let mut epochs_slab_ok = Slab::new();
+        let idx_ok = epochs_slab_ok.insert(Arc::new(CachePadded::new(AtomicUsize::new(2)))); // advanced
+        w.last_epochs = vec![0; epochs_slab_ok.capacity()];
+        w.last_epochs[idx_ok] = 1; // previously odd
+        w.epochs = Arc::new(Mutex::new(epochs_slab_ok));
         let before = w.refreshes;
         assert_eq!(w.try_publish(), true);
         assert_eq!(w.refreshes, before + 1);

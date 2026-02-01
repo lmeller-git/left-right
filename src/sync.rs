@@ -20,3 +20,9 @@ pub(crate) fn fence(ord: Ordering) {
 pub(crate) use alloc::sync::Arc;
 #[cfg(not(loom))]
 pub(crate) use core::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
+
+#[cfg(all(not(loom), not(feature = "std")))]
+pub(crate) use spin::{Mutex, MutexGuard};
+
+#[cfg(all(not(loom), feature = "std"))]
+pub(crate) use std::sync::{Mutex, MutexGuard};

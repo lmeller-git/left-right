@@ -44,6 +44,7 @@ pub struct ReadHandle<T> {
     // NOTE we may want to hold an Acquired<'pool, T> in order to release later, however this leads to lifetime complications
     // alternatively add a Acquired::from_ref method in sento, which returns the underlying Acquired for some &T (walk list or use repr c Acquired?)
     epoch: Arc<CachePadded<AtomicUsize>>,
+    epoch_i: usize,
     enters: Cell<usize>,
 
     // `ReadHandle` is _only_ Send if T is Sync. If T is !Sync, then it's not okay for us to expose
@@ -56,8 +57,11 @@ unsafe impl<T> Send for ReadHandle<T> where T: Sync {}
 
 impl<T> Drop for ReadHandle<T> {
     fn drop(&mut self) {
-        // We dont need a Drop implementation as of now, because the Epoch for this Handle will not
-        // be freed again
+        // epoch must already be even for us to have &mut self,
+        // so okay to lock since we're not holding up the epoch anyway.
+        let e = self.epochs.lock().unwrap().remove(self.epoch_i);
+        assert!(Arc::ptr_eq(&e, &self.epoch));
+        assert_eq!(self.enters.get(), 0);
     }
 }
 
@@ -84,12 +88,15 @@ impl<T> ReadHandle<T> {
     }
 
     fn new_with_arc(inner: Arc<AtomicPtr<T>>, epochs: crate::Epochs) -> Self {
-        // Obtain a new Epoch-Entry
-        let epoch = Arc::clone(epochs.acquire().into_ref());
+        // tell writer about our epoch tracker
+        let epoch = Arc::new(CachePadded::new(AtomicUsize::new(0)));
+        // okay to lock, since we're not holding up the epoch
+        let epoch_i = epochs.lock().unwrap().insert(Arc::clone(&epoch));
 
         Self {
             epochs,
             epoch,
+            epoch_i,
             enters: Cell::new(0),
             inner,
             _unimpl_send: PhantomData,
