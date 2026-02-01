@@ -181,16 +181,14 @@ extern crate alloc;
 
 mod sync;
 
+use crate::sync::Arc;
+use crate::sync::AtomicUsize;
 use crate::sync::Mutex;
 use alloc::boxed::Box;
-use alloc::sync::Arc;
-use core::sync::atomic::AtomicUsize;
 use crossbeam_utils::CachePadded;
 use slab::Slab;
 
 type Epochs = Arc<Mutex<Slab<Arc<CachePadded<AtomicUsize>>>>>;
-
-// type Epochs = Arc<sento::Pool<Arc<CachePadded<AtomicUsize>>>>;
 
 mod write;
 pub use crate::write::Taken;

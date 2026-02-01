@@ -59,7 +59,7 @@ impl<T> Drop for ReadHandle<T> {
     fn drop(&mut self) {
         // epoch must already be even for us to have &mut self,
         // so okay to lock since we're not holding up the epoch anyway.
-        let e = self.epochs.lock().unwrap().remove(self.epoch_i);
+        let e = self.epochs.lock().remove(self.epoch_i);
         assert!(Arc::ptr_eq(&e, &self.epoch));
         assert_eq!(self.enters.get(), 0);
     }
@@ -91,7 +91,7 @@ impl<T> ReadHandle<T> {
         // tell writer about our epoch tracker
         let epoch = Arc::new(CachePadded::new(AtomicUsize::new(0)));
         // okay to lock, since we're not holding up the epoch
-        let epoch_i = epochs.lock().unwrap().insert(Arc::clone(&epoch));
+        let epoch_i = epochs.lock().insert(Arc::clone(&epoch));
 
         Self {
             epochs,

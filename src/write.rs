@@ -3,6 +3,7 @@ use crate::sync::{fence, Ordering};
 use crate::{Absorb, Epochs};
 
 use crate::sync::Arc;
+use crate::sync::AtomicUsize;
 use crate::sync::MutexGuard;
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::fmt;
@@ -176,7 +177,7 @@ where
 
         // now, wait for all readers to depart
         let epochs = Arc::clone(&self.epochs);
-        let mut epochs = epochs.lock().unwrap();
+        let mut epochs = epochs.lock();
         self.wait(&mut epochs);
 
         // ensure that the subsequent epoch reads aren't re-ordered to before the swap
@@ -343,7 +344,7 @@ where
     /// Returns `true` if a publish occurred, `false` otherwise.
     pub fn try_publish(&mut self) -> bool {
         let epochs = Arc::clone(&self.epochs);
-        let mut epochs = epochs.lock().unwrap();
+        let mut epochs = epochs.lock();
         if self.wait_while(|| false, &mut epochs).is_err() {
             return false;
         }
@@ -367,7 +368,7 @@ where
         // only block on pre-existing readers, and they are never waiting to push onto epochs
         // unless they have finished reading.
         let epochs = Arc::clone(&self.epochs);
-        let mut epochs = epochs.lock().unwrap();
+        let mut epochs = epochs.lock();
         self.wait(&mut epochs);
         self.update_and_swap(&mut epochs)
     }
@@ -518,7 +519,6 @@ where
 
 // allow using write handle for reads
 use core::ops::Deref;
-use std::sync::atomic::AtomicUsize;
 impl<T, O> Deref for WriteHandle<T, O>
 where
     T: Absorb<O>,
@@ -637,6 +637,8 @@ mod tests {
     #![allow(clippy::bool_assert_comparison)]
     use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
     use crate::Absorb;
+    use alloc::boxed::Box;
+    use alloc::vec;
     use crossbeam_utils::CachePadded;
     use slab::Slab;
     include!("./utilities.rs");
@@ -697,15 +699,18 @@ mod tests {
         assert_eq!(*w.take(), 2);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn wait_test() {
-        use std::sync::{Arc, Barrier};
+        use crate::sync::Arc;
+        use std::sync::Barrier;
         use std::thread;
+
         let (mut w, _r) = crate::new::<i32, _>();
 
         // Case 1: If epoch is set to default.
         let test_epochs: crate::Epochs = Default::default();
-        let mut test_epochs = test_epochs.lock().unwrap();
+        let mut test_epochs = test_epochs.lock();
         // since there is no epoch to waiting for, wait function will return immediately.
         w.wait(&mut test_epochs);
 
@@ -731,7 +736,7 @@ mod tests {
         let test_epochs = Arc::new(Mutex::new(epochs_slab));
         let wait_handle = thread::spawn(move || {
             barrier2.wait();
-            let mut test_epochs = test_epochs.lock().unwrap();
+            let mut test_epochs = test_epochs.lock();
             w.wait(&mut test_epochs);
         });
 

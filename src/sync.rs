@@ -1,7 +1,23 @@
 #[cfg(loom)]
 pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 #[cfg(loom)]
-pub(crate) use loom::sync::{Arc, Mutex, MutexGuard};
+pub(crate) use mutex::*;
+#[cfg(loom)]
+mod mutex {
+    use core::ops::{Deref, DerefMut};
+    pub(crate) use loom::sync::Arc;
+    pub(crate) use loom::sync::MutexGuard;
+
+    #[derive(Debug, Default)]
+    pub(crate) struct Mutex<T>(loom::sync::Mutex<T>);
+
+    impl<T> Mutex<T> {
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            self.0.lock().unwrap()
+        }
+    }
+}
+
 #[cfg(loom)]
 pub(crate) fn fence(ord: Ordering) {
     if let Ordering::Acquire = ord {
@@ -25,4 +41,4 @@ pub(crate) use core::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 pub(crate) use spin::{Mutex, MutexGuard};
 
 #[cfg(all(not(loom), feature = "std"))]
-pub(crate) use std::sync::{Mutex, MutexGuard};
+pub(crate) use spin::{Mutex, MutexGuard};
